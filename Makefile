@@ -1,10 +1,9 @@
 VERSION := $(shell echo $(shell git describe --tags) | sed 's/^v//')
 COMMIT  := $(shell git log -1 --format='%H')
-SDKCOMMIT := $(shell go list -m -u -f '{{.Version}}' github.com/cosmos/cosmos-sdk)
-GAIA_VERSION := v5.0.4
-AKASH_VERSION := v0.12.1
-OSMOSIS_VERSION := v4.2.0
-WASMD_VERSION := v0.16.0
+GAIA_VERSION := v7.0.1
+AKASH_VERSION := v0.16.3
+OSMOSIS_VERSION := v8.0.0
+WASMD_VERSION := v0.25.0
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -15,10 +14,7 @@ all: lint install
 # Build / Install
 ###############################################################################
 
-LD_FLAGS = -X github.com/cosmos/relayer/cmd.Version=$(VERSION) \
-	-X github.com/cosmos/relayer/cmd.Commit=$(COMMIT) \
-	-X github.com/cosmos/relayer/cmd.SDKCommit=$(SDKCOMMIT) \
-	-X github.com/cosmos/relayer/cmd.GaiaCommit=$(GAIACOMMIT)
+LD_FLAGS = -X github.com/cosmos/relayer/v2/cmd.Version=$(VERSION)
 
 BUILD_FLAGS := -ldflags '$(LD_FLAGS)'
 
@@ -38,10 +34,6 @@ build-zip: go.sum
 	@GOOS=windows GOARCH=amd64 go build -mod=readonly $(BUILD_FLAGS) -o build/windows-amd64-rly.exe main.go
 	@tar -czvf release.tar.gz ./build
 
-# Compile the relayer as a shared library to be linked into another program
-compile-clib:
-	go build -v -mod=readonly -buildmode=c-shared -o librelayer.so ./clib
-
 install: go.sum
 	@echo "installing rly binary..."
 	@go build -mod=readonly $(BUILD_FLAGS) -o $(GOBIN)/rly main.go
@@ -53,23 +45,38 @@ build-akash-docker:
 	docker build -t ovrclk/akash:$(AKASH_VERSION) --build-arg VERSION=$(AKASH_VERSION) -f ./docker/akash/Dockerfile .
 
 build-osmosis-docker:
-	docker build -t ovrclk/akash:$(OSMOSIS_VERSION) --build-arg VERSION=$(OSMOSIS_VERSION) -f ./docker/akash/Dockerfile .
+	docker build -t osmosis-labs/osmosis:$(OSMOSIS_VERSION) --build-arg VERSION=$(OSMOSIS_VERSION) -f ./docker/osmosis/Dockerfile .
 
 ###############################################################################
 # Tests / CI
 ###############################################################################
 
 test:
-	@go test -mod=readonly -v ./test/...
+	@go test -mod=readonly -race ./...
 
-test-gaia:
-	@go test -mod=readonly -v -run TestGaiaToGaiaRelaying ./test/...
+ibctest:
+	cd ibctest && go test -race -v -run TestRelayerInProcess .
 
-test-akash:
-	@go test -mod=readonly -v -run TestAkashToGaiaRelaying ./test/...
+ibctest-docker:
+	cd ibctest && go test -race -v -run TestRelayerDocker .
 
-test-short:
-	@go test -mod=readonly -v -run TestOsmoToGaiaRelaying ./test/... 
+ibctest-docker-events:
+	cd ibctest && go test -race -v -run TestRelayerDockerEventProcessor .
+
+ibctest-docker-legacy:
+	cd ibctest && go test -race -v -run TestRelayerDockerLegacyProcessor .
+
+ibctest-events:
+	cd ibctest && go test -race -v -run TestRelayerEventProcessor .
+
+ibctest-legacy:
+	cd ibctest && go test -race -v -run TestRelayerLegacyProcessor .
+
+ibctest-multiple:
+	cd ibctest && go test -race -v -run TestRelayerMultiplePathsSingleProcess .
+
+ibctest-scenario: ## Scenario tests are suitable for simple networks of 1 validator and no full nodes. They test specific functionality.
+	cd ibctest && go test -race -v -run TestScenario .
 
 coverage:
 	@echo "viewing test coverage..."
@@ -86,31 +93,9 @@ lint:
 
 get-gaia:
 	@mkdir -p ./chain-code/
-	@git clone --branch $(GAIA_VERSION) git@github.com:cosmos/gaia.git ./chain-code/gaia
+	@git clone --branch $(GAIA_VERSION) --depth=1 https://github.com/cosmos/gaia.git ./chain-code/gaia
 
 build-gaia:
-	@./scripts/build-gaia
+	@./examples/demo/scripts/build-gaia
 
-build-akash:
-	@./scripts/build-akash
-
-get-akash:
-	@mkdir -p ./chain-code/
-	@git clone --branch $(AKASH_VERSION) git@github.com:ovrclk/akash.git ./chain-code/akash
-
-get-chains: get-gaia get-akash get-wasmd
-
-get-wasmd:
-	@mkdir -p ./chain-code/
-	@git clone --branch $(WASMD_VERSION) git@github.com:CosmWasm/wasmd.git ./chain-code/wasmd
-
-build-wasmd:
-	@./scripts/build-wasmd
-
-build-chains: build-akash build-gaia build-wasmd
-
-delete-chains: 
-	@echo "Removing the ./chain-code/ directory..."
-	@rm -rf ./chain-code
-
-.PHONY: two-chains test install build lint coverage clean
+.PHONY: two-chains test test-integration ibctest install build lint coverage clean

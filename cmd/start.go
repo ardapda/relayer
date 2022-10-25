@@ -6,7 +6,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,142 +17,154 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"math"
-	"os"
-	"os/signal"
+	"net"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
-	"github.com/avast/retry-go"
-	"github.com/cosmos/relayer/relayer"
+	"github.com/cosmos/relayer/v2/internal/relaydebug"
+	"github.com/cosmos/relayer/v2/relayer"
+	"github.com/cosmos/relayer/v2/relayer/chains/cosmos"
+	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	"golang.org/x/sync/errgroup"
+	"go.uber.org/zap"
 )
 
 // startCmd represents the start command
-// NOTE: This is basically pseudocode
-func startCmd() *cobra.Command {
+func startCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "start [path-name]",
+		Use:     "start path_name",
 		Aliases: []string{"st"},
 		Short:   "Start the listening relayer on a given path",
-		Args:    cobra.ExactArgs(1),
+		Args:    withUsage(cobra.MinimumNArgs(0)),
 		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s start           # start all configured paths
+$ %s start demo-path # start the 'demo-path' path
 $ %s start demo-path --max-msgs 3
-$ %s start demo-path2 --max-tx-size 10`, appName, appName)),
+$ %s start demo-path2 --max-tx-size 10`, appName, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, src, dst, err := config.ChainsFromPath(args[0])
+			chains := make(map[string]*relayer.Chain)
+			paths := make([]relayer.NamedPath, len(args))
+
+			if len(args) > 0 {
+				for i, pathName := range args {
+					path := a.Config.Paths.MustGet(pathName)
+					paths[i] = relayer.NamedPath{
+						Name: pathName,
+						Path: path,
+					}
+
+					// collect unique chain IDs
+					chains[path.Src.ChainID] = nil
+					chains[path.Dst.ChainID] = nil
+				}
+			} else {
+				for n, path := range a.Config.Paths {
+					paths = append(paths, relayer.NamedPath{
+						Name: n,
+						Path: path,
+					})
+
+					// collect unique chain IDs
+					chains[path.Src.ChainID] = nil
+					chains[path.Dst.ChainID] = nil
+				}
+			}
+
+			chainIDs := make([]string, 0, len(chains))
+			for chainID := range chains {
+				chainIDs = append(chainIDs, chainID)
+			}
+
+			// get chain configurations
+			chains, err := a.Config.Chains.Gets(chainIDs...)
 			if err != nil {
 				return err
 			}
 
-			if err = ensureKeysExist(c); err != nil {
+			if err := ensureKeysExist(chains); err != nil {
 				return err
 			}
 
-			path := config.Paths.MustGet(args[0])
 			maxTxSize, maxMsgLength, err := GetStartOptions(cmd)
 			if err != nil {
 				return err
 			}
 
-			if relayer.SendToController != nil {
-				action := relayer.PathAction{
-					Path: path,
-					Type: "RELAYER_PATH_START",
+			var prometheusMetrics *processor.PrometheusMetrics
+
+			debugAddr, err := cmd.Flags().GetString(flagDebugAddr)
+			if err != nil {
+				return err
+			}
+			if debugAddr == "" {
+				a.Log.Info("Skipping debug server due to empty debug address flag")
+			} else {
+				ln, err := net.Listen("tcp", debugAddr)
+				if err != nil {
+					a.Log.Error("Failed to listen on debug address. If you have another relayer process open, use --" + flagDebugAddr + " to pick a different address.")
+					return fmt.Errorf("failed to listen on debug address %q: %w", debugAddr, err)
 				}
-				cont, err := relayer.ControllerUpcall(&action)
-				if !cont {
-					return err
+				log := a.Log.With(zap.String("sys", "debughttp"))
+				log.Info("Debug server listening", zap.String("addr", debugAddr))
+				relaydebug.StartDebugServer(cmd.Context(), log, ln)
+				prometheusMetrics = processor.NewPrometheusMetrics()
+				for _, chain := range chains {
+					if ccp, ok := chain.ChainProvider.(*cosmos.CosmosProvider); ok {
+						ccp.SetMetrics(prometheusMetrics)
+					}
 				}
 			}
 
-			done, err := relayer.StartRelayer(c[src], c[dst], maxTxSize, maxMsgLength)
+			processorType, err := cmd.Flags().GetString(flagProcessor)
+			if err != nil {
+				return err
+			}
+			initialBlockHistory, err := cmd.Flags().GetUint64(flagInitialBlockHistory)
 			if err != nil {
 				return err
 			}
 
-			thresholdTime := viper.GetDuration(flagThresholdTime)
-
-			eg := new(errgroup.Group)
-			eg.Go(func() error {
-				for {
-					var timeToExpiry time.Duration
-					if err := retry.Do(func() error {
-						timeToExpiry, err = UpdateClientsFromChains(c[src], c[dst], thresholdTime)
-						if err != nil {
-							return err
-						}
-						return nil
-					}, retry.Attempts(5), retry.Delay(time.Millisecond*500), retry.LastErrorOnly(true)); err != nil {
-						return err
-					}
-					time.Sleep(timeToExpiry - thresholdTime)
-				}
-			})
-			if err = eg.Wait(); err != nil {
+			clientUpdateThresholdTime, err := cmd.Flags().GetDuration(flagThresholdTime)
+			if err != nil {
 				return err
 			}
 
-			trapSignal(done)
+			rlyErrCh := relayer.StartRelayer(
+				cmd.Context(),
+				a.Log,
+				chains,
+				paths,
+				maxTxSize, maxMsgLength,
+				a.Config.memo(cmd),
+				clientUpdateThresholdTime,
+				processorType, initialBlockHistory,
+				prometheusMetrics,
+			)
+
+			// Block until the error channel sends a message.
+			// The context being canceled will cause the relayer to stop,
+			// so we don't want to separately monitor the ctx.Done channel,
+			// because we would risk returning before the relayer cleans up.
+			if err := <-rlyErrCh; err != nil && !errors.Is(err, context.Canceled) {
+				a.Log.Warn(
+					"Relayer start error",
+					zap.Error(err),
+				)
+				return err
+			}
 			return nil
 		},
 	}
-	return strategyFlag(updateTimeFlags(cmd))
-}
-
-// trap signal waits for a SIGINT or SIGTERM and then sends down the done channel
-func trapSignal(done func()) {
-	sigCh := make(chan os.Signal, 1)
-
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// wait for a signal
-	sig := <-sigCh
-	fmt.Println("Signal Received", sig.String())
-	close(sigCh)
-
-	// call the cleanup func
-	done()
-}
-
-// UpdateClientsFromChains takes src, dst chains, threshold time and update clients based on expiry time
-func UpdateClientsFromChains(src, dst *relayer.Chain, thresholdTime time.Duration) (time.Duration, error) {
-	var (
-		srcTimeExpiry, dstTimeExpiry time.Duration
-		err                          error
-	)
-
-	eg := new(errgroup.Group)
-	eg.Go(func() error {
-		srcTimeExpiry, err = src.ChainProvider.AutoUpdateClient(dst.ChainProvider, thresholdTime, src.ClientID(), dst.ClientID())
-		return err
-	})
-	eg.Go(func() error {
-		dstTimeExpiry, err = dst.ChainProvider.AutoUpdateClient(src.ChainProvider, thresholdTime, dst.ClientID(), src.ClientID())
-		return err
-	})
-	if err := eg.Wait(); err != nil {
-		return 0, err
-	}
-
-	if srcTimeExpiry <= 0 {
-		return 0, fmt.Errorf("client (%s) of chain: %s is expired",
-			src.PathEnd.ClientID, src.ChainID())
-	}
-
-	if dstTimeExpiry <= 0 {
-		return 0, fmt.Errorf("client (%s) of chain: %s is expired",
-			dst.PathEnd.ClientID, dst.ChainID())
-	}
-
-	minTimeExpiry := math.Min(float64(srcTimeExpiry), float64(dstTimeExpiry))
-
-	return time.Duration(int64(minTimeExpiry)), nil
+	cmd = updateTimeFlags(a.Viper, cmd)
+	cmd = strategyFlag(a.Viper, cmd)
+	cmd = debugServerFlags(a.Viper, cmd)
+	cmd = processorFlag(a.Viper, cmd)
+	cmd = initBlockFlag(a.Viper, cmd)
+	cmd = memoFlag(a.Viper, cmd)
+	return cmd
 }
 
 // GetStartOptions sets strategy specific fields.
